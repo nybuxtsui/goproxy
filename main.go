@@ -185,17 +185,19 @@ func doProxy(c net.Conn) {
 		defer c2.Close()
 		c.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
 	} else {
-		p1 := bytes.Index(buff[:n], []byte("\r\nHost: "))
+		p1 := bytes.Index(buff[:n], []byte("http://"))
 		if p1 == -1 {
 			log.Println("http proxy format error, host not found")
 			return
 		}
-		p2 := bytes.Index(buff[p1+8:n], []byte("\r\n"))
+		p2 := bytes.Index(buff[p1+7:n], []byte("/"))
 		if p2 == -1 {
 			log.Println("http proxy format error, host not finish")
 			return
 		}
-		url := string(buff[p1+8 : p1+8+p2])
+		url := string(buff[p1+7 : p1+7+p2])
+		buff = append(buff[:p1], buff[p1+7+p2:]...)
+		n -= (7 + p2)
 		p3 := strings.IndexByte(url, ':')
 		port := 80
 		_port := "80"
