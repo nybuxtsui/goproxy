@@ -14,18 +14,19 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+type ChannelDefine struct {
+	Type string `toml:"type"`
+	Addr string `toml:"addr"`
+}
+
 var Config struct {
 	Listen  string `toml:"listen"`
 	Channel []struct {
 		Name    string   `toml:"name"`
-		Type    string   `toml:"type"`
-		Addr    string   `toml:"addr"`
 		Domains []string `toml:"domains"`
+		ChannelDefine
 	} `toml:"channel"`
-	Default struct {
-		Type string `toml:"type"`
-		Addr string `toml:"addr"`
-	} `toml:"default"`
+	Default ChannelDefine `toml:"default"`
 }
 
 func main() {
@@ -56,31 +57,64 @@ func main() {
 	}
 }
 
-func indomains(domain string, port uint16) (net.Conn, error) {
-	for _, channel := range Config.Channel {
-		for _, d := range channel.Domains {
-			if d[1:] == domain || strings.HasSuffix(domain, d) {
-				log.Println(channel.Name, ":", domain)
-				if channel.Type == "socks5" {
-					return connectSocks5(channel.Addr, domain, port)
-				} else {
-					return net.Dial("tcp", fmt.Sprintf("%s:%v", domain, port))
-				}
-			}
-		}
-	}
-	log.Println("default :", domain)
-	if Config.Default.Type == "socks5" {
-		return connectSocks5(Config.Default.Addr, domain, port)
+func getConnectByChannel(channel ChannelDefine, domain string, port uint16) (net.Conn, error) {
+	if channel.Type == "socks5" {
+		return connectSocks5(channel.Addr, domain, port)
+	} else if channel.Type == "http" {
+		return connectHttpProxy(channel.Addr, domain, port)
 	} else {
 		return net.Dial("tcp", fmt.Sprintf("%s:%v", domain, port))
 	}
 }
 
-func connectSocks5(socks, domain string, port uint16) (net.Conn, error) {
-	c2, err := net.Dial("tcp", socks)
+func getProxyConnect(domain string, port uint16) (net.Conn, error) {
+	for _, channel := range Config.Channel {
+		for _, d := range channel.Domains {
+			if d[1:] == domain || strings.HasSuffix(domain, d) {
+				log.Println(channel.Name, ":", domain)
+				return getConnectByChannel(channel.ChannelDefine, domain, port)
+			}
+		}
+	}
+	log.Println("default :", domain)
+	return getConnectByChannel(Config.Default, domain, port)
+}
+
+func connectHttpProxy(http, domain string, port uint16) (net.Conn, error) {
+	c2, err := net.Dial("tcp", http)
 	if err != nil {
-		log.Println("Conn.Dial failed:", err, socks)
+		log.Println("Conn.Dial failed:", err, http)
+		return nil, err
+	}
+	c2.SetDeadline(time.Now().Add(10 * time.Second))
+	c2.Write([]byte(fmt.Sprintf("CONNECT %v:%v HTTP/1.1\r\nHost: %v:%v\r\n\r\n", domain, port)))
+	buff := make([]byte, 17, 256)
+	c2.Read(buff)
+	for !bytes.HasSuffix(buff, []byte("\r\n\r\n")) {
+		ch := make([]byte, 1)
+		_, err = c2.Read(ch)
+		if err != nil {
+			log.Println("Conn.Read failed:", err, http)
+			return nil, err
+		}
+		buff = append(buff, ch[0])
+		if len(buff) > 255 {
+			log.Println("HTTP Proxy Connect failed: return too long")
+			return nil, errors.New("http_proxy_failed")
+		}
+	}
+	if buff[9] != '2' {
+		log.Println("HTTP Proxy Connect failed:", string(buff))
+		return nil, errors.New("http_proxy_failed")
+	}
+	c2.SetDeadline(time.Time{})
+	return c2, nil
+}
+
+func connectSocks5(socks5, domain string, port uint16) (net.Conn, error) {
+	c2, err := net.Dial("tcp", socks5)
+	if err != nil {
+		log.Println("Conn.Dial failed:", err, socks5)
 		return nil, err
 	}
 	c2.SetDeadline(time.Now().Add(10 * time.Second))
@@ -177,7 +211,7 @@ func doProxy(c net.Conn) {
 			log.Println("http proxy port format error, ", err)
 			return
 		}
-		c2, err = indomains(domain, uint16(port))
+		c2, err = getProxyConnect(domain, uint16(port))
 		if err != nil {
 			log.Println("connect socks5 failed:", err)
 			return
@@ -213,7 +247,7 @@ func doProxy(c net.Conn) {
 				return
 			}
 		}
-		c2, err = indomains(domain, uint16(port))
+		c2, err = getProxyConnect(domain, uint16(port))
 		if err != nil {
 			log.Println("connect socks5 failed:", err)
 			return
