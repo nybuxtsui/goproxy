@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -76,21 +76,38 @@ func getConnectByChannel(channel ChannelDefine, domain string, port uint16) (net
 	}
 }
 
+var sspos = 0
+var ssaddrs []string
+var sslock sync.RWMutex
+
 func connectShadowSocks(method, password, ssaddr string, domain string, port uint16) (net.Conn, error) {
 	cipher, err := ss.NewCipher(method, password)
 	if err != nil {
 		log.Println("ss.NewCipher failed:", err)
 		return nil, err
 	}
-	ssaddrs := strings.Split(ssaddr, ",")
-	addr := ssaddrs[rand.Intn(len(ssaddrs))]
+	var once sync.Once
+	once.Do(func() {
+		ssaddrs = strings.Split(ssaddr, ",")
+	})
+
+	sslock.RLock()
+	addr := ssaddrs[sspos]
+	sslock.RUnlock()
 
 	rawaddr := make([]byte, 0, 512)
 	rawaddr = append(rawaddr, []byte{3, byte(len(domain))}...)
 	rawaddr = append(rawaddr, []byte(domain)...)
 	rawaddr = append(rawaddr, byte(port>>8))
 	rawaddr = append(rawaddr, byte(port&0xff))
-	return ss.DialWithRawAddr(rawaddr, addr, cipher.Copy())
+	c, err := ss.DialWithRawAddr(rawaddr, addr, cipher.Copy())
+	if err != nil {
+		sslock.Lock()
+		sspos++
+		sspos = sspos % len(ssaddrs)
+		sslock.Unlock()
+	}
+	return c, err
 }
 
 func getProxyConnect(domain string, port uint16) (net.Conn, error) {
