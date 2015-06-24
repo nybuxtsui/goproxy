@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
 )
 
 type ChannelDefine struct {
@@ -58,13 +60,37 @@ func main() {
 }
 
 func getConnectByChannel(channel ChannelDefine, domain string, port uint16) (net.Conn, error) {
-	if channel.Type == "socks5" {
+	if strings.HasPrefix(channel.Type, "ss,") {
+		parts := strings.SplitN(channel.Type, ",", 3)
+		if len(parts) != 3 {
+			log.Println("Config shadowsocks failed:", channel.Type)
+			return nil, errors.New("config_error")
+		}
+		return connectShadowSocks(parts[1], parts[2], channel.Addr, domain, port)
+	} else if channel.Type == "socks5" {
 		return connectSocks5(channel.Addr, domain, port)
 	} else if channel.Type == "http" {
 		return connectHttpProxy(channel.Addr, domain, port)
 	} else {
 		return net.Dial("tcp", fmt.Sprintf("%s:%v", domain, port))
 	}
+}
+
+func connectShadowSocks(method, password, ssaddr string, domain string, port uint16) (net.Conn, error) {
+	cipher, err := ss.NewCipher(method, password)
+	if err != nil {
+		log.Println("ss.NewCipher failed:", err)
+		return nil, err
+	}
+	ssaddrs := strings.Split(ssaddr, ",")
+	addr := ssaddrs[rand.Intn(len(ssaddrs))]
+
+	rawaddr := make([]byte, 0, 512)
+	rawaddr = append(rawaddr, []byte{3, byte(len(domain))}...)
+	rawaddr = append(rawaddr, []byte(domain)...)
+	rawaddr = append(rawaddr, byte(port>>8))
+	rawaddr = append(rawaddr, byte(port&0xff))
+	return ss.DialWithRawAddr(rawaddr, addr, cipher.Copy())
 }
 
 func getProxyConnect(domain string, port uint16) (net.Conn, error) {
@@ -261,11 +287,7 @@ func doProxy(c net.Conn) {
 	}
 
 	go doPeer(c, c2)
-
-	_, err = io.Copy(c2, c)
-	if err != nil {
-		return
-	}
+	io.Copy(c2, c)
 }
 
 func doPeer(c1 net.Conn, c2 net.Conn) {
