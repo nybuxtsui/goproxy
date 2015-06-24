@@ -17,19 +17,24 @@ import (
 )
 
 type ChannelDefine struct {
+	Name string `toml:"name"`
 	Type string `toml:"type"`
 	Addr string `toml:"addr"`
 }
 
+var sspos = 0
+var ssaddrs []string
+var sslock sync.RWMutex
 var Config struct {
 	Listen  string `toml:"listen"`
 	Channel []struct {
-		Name    string   `toml:"name"`
 		Domains []string `toml:"domains"`
 		ChannelDefine
 	} `toml:"channel"`
 	Default ChannelDefine `toml:"default"`
 }
+var channelCache = make(map[string]*ChannelDefine)
+var channelLock sync.RWMutex
 
 func main() {
 	Config.Listen = "127.0.0.1:8080"
@@ -59,26 +64,27 @@ func main() {
 	}
 }
 
-func getConnectByChannel(channel ChannelDefine, domain string, port uint16) (net.Conn, error) {
+func getConnectByChannel(channel ChannelDefine, domain string, port uint16) (net.Conn, bool, error) {
+	log.Println(channel.Name, ":", domain)
 	if strings.HasPrefix(channel.Type, "ss,") {
 		parts := strings.SplitN(channel.Type, ",", 3)
 		if len(parts) != 3 {
 			log.Println("Config shadowsocks failed:", channel.Type)
-			return nil, errors.New("config_error")
+			return nil, false, errors.New("config_error")
 		}
-		return connectShadowSocks(parts[1], parts[2], channel.Addr, domain, port)
+		c, err := connectShadowSocks(parts[1], parts[2], channel.Addr, domain, port)
+		return c, false, err
 	} else if channel.Type == "socks5" {
-		return connectSocks5(channel.Addr, domain, port)
+		c, err := connectSocks5(channel.Addr, domain, port)
+		return c, false, err
 	} else if channel.Type == "http" {
-		return connectHttpProxy(channel.Addr, domain, port)
+		c, err := connectHttpProxy(channel.Addr, domain, port)
+		return c, false, err
 	} else {
-		return net.Dial("tcp", fmt.Sprintf("%s:%v", domain, port))
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%v", domain, port), time.Second*5)
+		return c, true, err
 	}
 }
-
-var sspos = 0
-var ssaddrs []string
-var sslock sync.RWMutex
 
 func connectShadowSocks(method, password, ssaddr string, domain string, port uint16) (net.Conn, error) {
 	cipher, err := ss.NewCipher(method, password)
@@ -110,16 +116,24 @@ func connectShadowSocks(method, password, ssaddr string, domain string, port uin
 	return c, err
 }
 
-func getProxyConnect(domain string, port uint16) (net.Conn, error) {
+func getProxyConnect(domain string, port uint16) (net.Conn, bool, error) {
+	channelLock.RLock()
+	channel, ok := channelCache[domain]
+	channelLock.RUnlock()
+	if ok {
+		return getConnectByChannel(*channel, domain, port)
+	}
 	for _, channel := range Config.Channel {
 		for _, d := range channel.Domains {
 			if d[1:] == domain || strings.HasSuffix(domain, d) {
-				log.Println(channel.Name, ":", domain)
+				channelLock.Lock()
+				channelCache[domain] = &channel.ChannelDefine
+				channelLock.Unlock()
+
 				return getConnectByChannel(channel.ChannelDefine, domain, port)
 			}
 		}
 	}
-	log.Println("default :", domain)
 	return getConnectByChannel(Config.Default, domain, port)
 }
 
@@ -232,6 +246,8 @@ func doProxy(c net.Conn) {
 		return
 	}
 	var c2 net.Conn
+	var domain string
+	var direct bool
 	if bytes.HasPrefix(buff[:n], []byte("CONNECT ")) {
 		if !bytes.HasSuffix(buff[:n], []byte("\r\n\r\n")) {
 			log.Println("http proxy format error, not finished")
@@ -242,7 +258,7 @@ func doProxy(c net.Conn) {
 			log.Println("http proxy format error, ':' not found")
 			return
 		}
-		domain := string(buff[8 : 8+p2])
+		domain = string(buff[8 : 8+p2])
 		p3 := bytes.IndexByte(buff[8+p2+1:n], ' ')
 		if p3 == -1 {
 			log.Println("http proxy format error, ' ' not found")
@@ -254,9 +270,9 @@ func doProxy(c net.Conn) {
 			log.Println("http proxy port format error, ", err)
 			return
 		}
-		c2, err = getProxyConnect(domain, uint16(port))
+		c2, direct, err = getProxyConnect(domain, uint16(port))
 		if err != nil {
-			log.Println("connect socks5 failed:", err)
+			log.Println("connect failed:", err)
 			return
 		}
 		defer c2.Close()
@@ -278,7 +294,7 @@ func doProxy(c net.Conn) {
 		p3 := strings.IndexByte(url, ':')
 		port := 80
 		_port := "80"
-		domain := url
+		domain = url
 		if p3 == -1 {
 			url += ":80"
 		} else {
@@ -290,7 +306,7 @@ func doProxy(c net.Conn) {
 				return
 			}
 		}
-		c2, err = getProxyConnect(domain, uint16(port))
+		c2, direct, err = getProxyConnect(domain, uint16(port))
 		if err != nil {
 			log.Println("connect socks5 failed:", err)
 			return
@@ -302,17 +318,12 @@ func doProxy(c net.Conn) {
 			return
 		}
 	}
+	_ = direct
 
-	go doPeer(c, c2)
+	go func() {
+		defer c2.Close()
+		defer c.Close()
+		io.Copy(c, c2)
+	}()
 	io.Copy(c2, c)
-}
-
-func doPeer(c1 net.Conn, c2 net.Conn) {
-	defer c1.Close()
-	defer c2.Close()
-
-	_, err := io.Copy(c1, c2)
-	if err != nil {
-		return
-	}
 }
