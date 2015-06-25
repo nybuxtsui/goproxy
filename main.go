@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -37,7 +38,7 @@ var channelCache = make(map[string]*ChannelDefine)
 var channelLock sync.RWMutex
 
 func main() {
-	Config.Listen = "127.0.0.1:8080"
+	Config.Listen = "127.0.0.1:18080"
 	_, err := toml.DecodeFile("goproxy.conf", &Config)
 	if err != nil {
 		log.Fatalln("DecodeFile failed:", err)
@@ -134,6 +135,9 @@ func getProxyConnect(domain string, port uint16) (net.Conn, bool, error) {
 			}
 		}
 	}
+	channelLock.Lock()
+	channelCache[domain] = &Config.Default
+	channelLock.Unlock()
 	return getConnectByChannel(Config.Default, domain, port)
 }
 
@@ -235,49 +239,67 @@ func connectSocks5(socks5, domain string, port uint16) (net.Conn, error) {
 func doProxy(c net.Conn) {
 	defer c.Close()
 
-	buff := make([]byte, 16*1024)
-	n, err := c.Read(buff)
+	cr := bufio.NewReader(c)
+	buff, err := cr.Peek(3)
 	if err != nil {
 		log.Println("Conn.Read failed:", err)
 		return
 	}
-	if n < 10 {
-		log.Println("first package too small")
-		return
-	}
-	var c2 net.Conn
-	var domain string
+	var peer net.Conn
 	var direct bool
-	if bytes.HasPrefix(buff[:n], []byte("CONNECT ")) {
-		if !bytes.HasSuffix(buff[:n], []byte("\r\n\r\n")) {
-			log.Println("http proxy format error, not finished")
+	if bytes.Equal(buff, []byte("CON")) {
+		buff, err := cr.ReadSlice(' ')
+		if err != nil {
+			log.Println("Conn.Read failed:", err)
 			return
 		}
-		p2 := bytes.IndexByte(buff[8:n], ':')
-		if p2 == -1 {
-			log.Println("http proxy format error, ':' not found")
+		if !bytes.Equal(buff, []byte("CONNECT ")) {
+			log.Println("Protocol error:", string(buff))
 			return
 		}
-		domain = string(buff[8 : 8+p2])
-		p3 := bytes.IndexByte(buff[8+p2+1:n], ' ')
-		if p3 == -1 {
-			log.Println("http proxy format error, ' ' not found")
+		buff, err = cr.ReadSlice(':')
+		if err != nil {
+			log.Println("Conn.Read failed:", err)
 			return
 		}
-		_port := string(buff[8+p2+1 : 8+p2+1+p3])
+		if len(buff) <= 1 {
+			log.Println("CONNECT protocol error: host not found")
+			return
+		}
+		domain := string(buff[:len(buff)-1])
+		buff, err = cr.ReadSlice(' ')
+		if err != nil {
+			log.Println("Conn.Read failed:", err)
+			return
+		}
+		if len(buff) <= 1 {
+			log.Println("CONNECT protocol error: port not found")
+			return
+		}
+		_port := string(buff[:len(buff)-1])
 		port, err := strconv.Atoi(_port)
 		if err != nil {
-			log.Println("http proxy port format error, ", err)
+			log.Println("CONNECT protocol error: port format error:", err, _port)
 			return
 		}
-		c2, direct, err = getProxyConnect(domain, uint16(port))
+		for {
+			if buff, _, err = cr.ReadLine(); err != nil {
+				log.Println("Conn.Read failed:", err)
+				return
+			} else if len(buff) == 0 {
+				break
+			}
+		}
+		peer, direct, err = getProxyConnect(domain, uint16(port))
 		if err != nil {
 			log.Println("connect failed:", err)
 			return
 		}
-		defer c2.Close()
+		defer peer.Close()
 		c.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
-	} else {
+	} else if buff[0] >= 'A' && buff[0] <= 'Z' {
+		buff, err := cr.ReadBytes('\n')
+		n := len(buff)
 		p1 := bytes.Index(buff[:n], []byte("http://"))
 		if p1 == -1 {
 			log.Println("http proxy format error, host not found")
@@ -294,7 +316,7 @@ func doProxy(c net.Conn) {
 		p3 := strings.IndexByte(url, ':')
 		port := 80
 		_port := "80"
-		domain = url
+		domain := url
 		if p3 == -1 {
 			url += ":80"
 		} else {
@@ -306,24 +328,103 @@ func doProxy(c net.Conn) {
 				return
 			}
 		}
-		c2, direct, err = getProxyConnect(domain, uint16(port))
+		peer, direct, err = getProxyConnect(domain, uint16(port))
 		if err != nil {
 			log.Println("connect socks5 failed:", err)
 			return
 		}
-		defer c2.Close()
-		_, err = c2.Write(buff[:n])
+		defer peer.Close()
+		_, err = peer.Write(buff[:n])
 		if err != nil {
 			log.Println("Conn.Write failed:", err)
 			return
 		}
+	} else if buff[0] == 5 {
+		temp := make([]byte, 355)
+		_, err := io.ReadAtLeast(cr, temp, 2+int(buff[2]))
+		if err != nil {
+			log.Println("Conn.Read failed:", err)
+			return
+		}
+		ok := false
+		for _, ch := range temp[2 : buff[1]+2] {
+			if ch == 0 {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			log.Println("Socks5 NO ACCEPTABLE METHODS:", temp[:buff[1]+2])
+			return
+		}
+		_, err = c.Write([]byte{5, 0})
+		if err != nil {
+			log.Println("Conn.Write failed:", err)
+			return
+		}
+		buff, err = cr.Peek(5)
+		if err != nil {
+			log.Println("Conn.Read failed:", err)
+			return
+		}
+		if buff[1] != 1 {
+			log.Println("Socks5 not support cmd:", buff[1])
+			return
+		}
+		var domain string
+		var port uint16
+		var n int
+		switch buff[3] {
+		case 1, 4:
+			iplen := net.IPv4len
+			if buff[3] == 4 {
+				iplen = net.IPv6len
+			}
+			n, err = io.ReadAtLeast(cr, temp, 6+iplen)
+			if err != nil {
+				log.Println("Conn.Read failed:", err)
+				return
+			}
+			end := 4 + iplen
+			domain = net.IP(temp[4:end]).String()
+			port = uint16(temp[end])<<8 + uint16(temp[end+1])
+		case 3:
+			n, err = io.ReadAtLeast(cr, temp, 6+int(temp[4])+1)
+			if err != nil {
+				log.Println("Conn.Read failed:", err)
+				return
+			}
+			end := temp[4] + 5
+			domain = string(temp[5:end])
+			port = uint16(temp[end])<<8 + uint16(temp[end+1])
+		}
+		peer, direct, err = getProxyConnect(domain, uint16(port))
+		if err != nil {
+			log.Println("connect socks5 failed:", err)
+			temp[1] = 1
+			_, err = c.Write(temp[:n])
+			if err != nil {
+				log.Println("Conn.Write failed:", err)
+			}
+			return
+		}
+		_, err = c.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
+		if err != nil {
+			log.Println("Conn.Write failed:", err)
+			return
+		}
+		defer peer.Close()
+
+	} else {
+		log.Println("unknown protocol:", string(buff))
+		return
 	}
 	_ = direct
 
 	go func() {
-		defer c2.Close()
+		defer peer.Close()
 		defer c.Close()
-		io.Copy(c, c2)
+		io.Copy(c, peer)
 	}()
-	io.Copy(c2, c)
+	io.Copy(peer, cr)
 }
