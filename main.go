@@ -32,6 +32,7 @@ var Config struct {
 		Domains []string `toml:"domains"`
 		ChannelDefine
 	} `toml:"channel"`
+	Socks5  ChannelDefine `toml:"socks5"`
 	Default ChannelDefine `toml:"default"`
 }
 var channelCache = make(map[string]*ChannelDefine)
@@ -398,7 +399,7 @@ func doProxy(c net.Conn) {
 			domain = string(temp[5:end])
 			port = uint16(temp[end])<<8 + uint16(temp[end+1])
 		}
-		peer, direct, err = getProxyConnect(domain, uint16(port))
+		peer, direct, err = getConnectByChannel(Config.Socks5, domain, uint16(port))
 		if err != nil {
 			log.Println("connect socks5 failed:", err)
 			temp[1] = 1
