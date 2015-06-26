@@ -21,6 +21,10 @@ type ChannelDefine struct {
 	Name string `toml:"name"`
 	Type string `toml:"type"`
 	Addr string `toml:"addr"`
+
+	addr  string
+	index int
+	lock  sync.RWMutex
 }
 
 type EConn struct {
@@ -76,6 +80,20 @@ var Config struct {
 var channelCache = make(map[string]*ChannelDefine)
 var channelLock sync.RWMutex
 
+func (c *ChannelDefine) switchss() {
+	addrs := strings.Split(c.Addr, ",")
+	if !strings.HasPrefix(c.Type, "ss,") {
+		return
+	}
+	c.lock.Lock()
+	c.index++
+	c.index = c.index % len(addrs)
+	c.addr = addrs[c.index]
+	addr := c.addr
+	c.lock.Unlock()
+	log.Println("switch:", addr)
+}
+
 func main() {
 	Config.Listen = "127.0.0.1:18080"
 	_, err := toml.DecodeFile("goproxy.conf", &Config)
@@ -104,7 +122,7 @@ func main() {
 	}
 }
 
-func getConnectByChannel(channel ChannelDefine, domain string, port uint16) (net.Conn, bool, error) {
+func getConnectByChannel(channel *ChannelDefine, domain string, port uint16) (net.Conn, bool, error) {
 	log.Println(channel.Name, ":", domain)
 	if strings.HasPrefix(channel.Type, "ss,") {
 		parts := strings.SplitN(channel.Type, ",", 3)
@@ -112,7 +130,17 @@ func getConnectByChannel(channel ChannelDefine, domain string, port uint16) (net
 			log.Println("Config shadowsocks failed:", channel.Type)
 			return nil, false, errors.New("config_error")
 		}
-		c, err := connectShadowSocks(parts[1], parts[2], channel.Addr, domain, port)
+		channel.lock.RLock()
+		if channel.addr == "" {
+			channel.index = 0
+			channel.addr = strings.Split(channel.Addr, ",")[channel.index]
+		}
+		addr := channel.addr
+		channel.lock.RUnlock()
+		c, err := connectShadowSocks(parts[1], parts[2], addr, domain, port)
+		if err != nil {
+			channel.switchss()
+		}
 		return c, false, err
 	} else if channel.Type == "socks5" {
 		c, err := connectSocks5(channel.Addr, domain, port)
@@ -132,28 +160,13 @@ func connectShadowSocks(method, password, ssaddr string, domain string, port uin
 		log.Println("ss.NewCipher failed:", err)
 		return nil, err
 	}
-	var once sync.Once
-	once.Do(func() {
-		ssaddrs = strings.Split(ssaddr, ",")
-	})
-
-	sslock.RLock()
-	addr := ssaddrs[sspos]
-	sslock.RUnlock()
 
 	rawaddr := make([]byte, 0, 512)
 	rawaddr = append(rawaddr, []byte{3, byte(len(domain))}...)
 	rawaddr = append(rawaddr, []byte(domain)...)
 	rawaddr = append(rawaddr, byte(port>>8))
 	rawaddr = append(rawaddr, byte(port&0xff))
-	c, err := ss.DialWithRawAddr(rawaddr, addr, cipher.Copy())
-	if err != nil {
-		sslock.Lock()
-		sspos++
-		sspos = sspos % len(ssaddrs)
-		sslock.Unlock()
-	}
-	return c, err
+	return ss.DialWithRawAddr(rawaddr, ssaddr, cipher.Copy())
 }
 
 func getProxyConnect(domain string, port uint16) (net.Conn, bool, error) {
@@ -161,23 +174,24 @@ func getProxyConnect(domain string, port uint16) (net.Conn, bool, error) {
 	channel, ok := channelCache[domain]
 	channelLock.RUnlock()
 	if ok {
-		return getConnectByChannel(*channel, domain, port)
+		return getConnectByChannel(channel, domain, port)
 	}
-	for _, channel := range Config.Channel {
+	for i, _ := range Config.Channel {
+		channel := &Config.Channel[i]
 		for _, d := range channel.Domains {
 			if d[1:] == domain || strings.HasSuffix(domain, d) {
 				channelLock.Lock()
 				channelCache[domain] = &channel.ChannelDefine
 				channelLock.Unlock()
 
-				return getConnectByChannel(channel.ChannelDefine, domain, port)
+				return getConnectByChannel(&channel.ChannelDefine, domain, port)
 			}
 		}
 	}
 	channelLock.Lock()
 	channelCache[domain] = &Config.Default
 	channelLock.Unlock()
-	return getConnectByChannel(Config.Default, domain, port)
+	return getConnectByChannel(&Config.Default, domain, port)
 }
 
 func connectHttpProxy(http, domain string, port uint16) (net.Conn, error) {
@@ -351,6 +365,33 @@ func doProxy(c net.Conn) {
 		c.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
 	} else if buff[0] >= 'A' && buff[0] <= 'Z' {
 		buff, err := cr.(*bufio.Reader).ReadBytes('\n')
+		if err != nil {
+			log.Println("Conn.Read failed:", err)
+			return
+		}
+		if bytes.HasPrefix(buff, []byte("GET /switch:")) {
+			n := bytes.IndexByte(buff[12:], ' ')
+			if n == -1 {
+				log.Println("Switch error:", string(buff))
+				c.Write([]byte("HTTP/1.1 200 OK\r\n\r\nerror"))
+				return
+			}
+			name := string(buff[12 : 12+n])
+			for i, _ := range Config.Channel {
+				channel := &Config.Channel[i]
+				if name == "all" || channel.Name == name {
+					channel.switchss()
+				}
+			}
+			if name == "all" || Config.Socks5.Name == name {
+				Config.Socks5.switchss()
+			}
+			if name == "all" || Config.Default.Name == name {
+				Config.Default.switchss()
+			}
+			c.Write([]byte("HTTP/1.1 200 OK\r\n\r\nok"))
+			return
+		}
 		n := len(buff)
 		p1 := bytes.Index(buff[:n], []byte("http://"))
 		if p1 == -1 {
@@ -461,7 +502,7 @@ func doProxy(c net.Conn) {
 			port = uint16(temp[end])<<8 + uint16(temp[end+1])
 		}
 		if method == 0 {
-			peer, direct, err = getConnectByChannel(Config.Socks5, domain, uint16(port))
+			peer, direct, err = getConnectByChannel(&Config.Socks5, domain, uint16(port))
 		} else {
 			peer, direct, err = getProxyConnect(domain, uint16(port))
 		}
