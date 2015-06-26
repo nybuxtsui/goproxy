@@ -23,6 +23,44 @@ type ChannelDefine struct {
 	Addr string `toml:"addr"`
 }
 
+type EConn struct {
+	net.Conn
+}
+
+func (c *EConn) Read(b []byte) (n int, err error) {
+	n, err = c.Conn.Read(b)
+	if err != nil {
+		return
+	}
+	for i := 0; i < n; i++ {
+		b[i] = ^b[i]
+	}
+	return
+}
+
+func (c *EConn) Write(b []byte) (n int, err error) {
+	b1 := make([]byte, len(b))
+	for i, c := range b {
+		b1[i] = ^c
+	}
+	return c.Conn.Write(b1)
+}
+
+type EReader struct {
+	r io.Reader
+}
+
+func (r *EReader) Read(p []byte) (n int, err error) {
+	n, err = r.r.Read(p)
+	if err != nil {
+		return
+	}
+	for i := 0; i < n; i++ {
+		p[i] = ^p[i]
+	}
+	return
+}
+
 var sspos = 0
 var ssaddrs []string
 var sslock sync.RWMutex
@@ -180,7 +218,7 @@ func connectSocks5(socks5, domain string, port uint16) (net.Conn, error) {
 		return nil, err
 	}
 	c2.SetDeadline(time.Now().Add(10 * time.Second))
-	c2.Write([]byte{5, 1, 0})
+	c2.Write([]byte{5, 2, 0, 0x81})
 	resp := make([]byte, 2)
 	n, err := c2.Read(resp)
 	if err != nil {
@@ -191,13 +229,22 @@ func connectSocks5(socks5, domain string, port uint16) (net.Conn, error) {
 		log.Println("socks5 response error:", resp)
 		return nil, errors.New("socks5_error")
 	}
-	if resp[1] != 0 {
+	method := resp[1]
+	if method != 0 && method != 0x81 {
 		log.Println("socks5 not support 'NO AUTHENTICATION REQUIRED'")
 		return nil, errors.New("socks5_error")
 	}
 	send := make([]byte, 0, 512)
 	send = append(send, []byte{5, 1, 0, 3, byte(len(domain))}...)
-	send = append(send, []byte(domain)...)
+	if method == 0 {
+		send = append(send, []byte(domain)...)
+	} else {
+		edomain := []byte(domain)
+		for i, c := range edomain {
+			edomain[i] = ^c
+		}
+		send = append(send, edomain...)
+	}
 	send = append(send, byte(port>>8))
 	send = append(send, byte(port&0xff))
 	_, err = c2.Write(send)
@@ -234,14 +281,18 @@ func connectSocks5(socks5, domain string, port uint16) (net.Conn, error) {
 		return nil, errors.New("socks5_error")
 	}
 	c2.SetDeadline(time.Time{})
-	return c2, nil
+	if method == 0 {
+		return c2, nil
+	} else {
+		return &EConn{c2}, nil
+	}
 }
 
 func doProxy(c net.Conn) {
 	defer c.Close()
 
-	cr := bufio.NewReader(c)
-	buff, err := cr.Peek(3)
+	var cr io.Reader = bufio.NewReader(c)
+	buff, err := cr.(*bufio.Reader).Peek(3)
 	if err != nil {
 		log.Println("Conn.Read failed:", err)
 		return
@@ -249,7 +300,7 @@ func doProxy(c net.Conn) {
 	var peer net.Conn
 	var direct bool
 	if bytes.Equal(buff, []byte("CON")) {
-		buff, err := cr.ReadSlice(' ')
+		buff, err := cr.(*bufio.Reader).ReadSlice(' ')
 		if err != nil {
 			log.Println("Conn.Read failed:", err)
 			return
@@ -258,7 +309,7 @@ func doProxy(c net.Conn) {
 			log.Println("Protocol error:", string(buff))
 			return
 		}
-		buff, err = cr.ReadSlice(':')
+		buff, err = cr.(*bufio.Reader).ReadSlice(':')
 		if err != nil {
 			log.Println("Conn.Read failed:", err)
 			return
@@ -268,7 +319,7 @@ func doProxy(c net.Conn) {
 			return
 		}
 		domain := string(buff[:len(buff)-1])
-		buff, err = cr.ReadSlice(' ')
+		buff, err = cr.(*bufio.Reader).ReadSlice(' ')
 		if err != nil {
 			log.Println("Conn.Read failed:", err)
 			return
@@ -284,7 +335,7 @@ func doProxy(c net.Conn) {
 			return
 		}
 		for {
-			if buff, _, err = cr.ReadLine(); err != nil {
+			if buff, _, err = cr.(*bufio.Reader).ReadLine(); err != nil {
 				log.Println("Conn.Read failed:", err)
 				return
 			} else if len(buff) == 0 {
@@ -299,7 +350,7 @@ func doProxy(c net.Conn) {
 		defer peer.Close()
 		c.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
 	} else if buff[0] >= 'A' && buff[0] <= 'Z' {
-		buff, err := cr.ReadBytes('\n')
+		buff, err := cr.(*bufio.Reader).ReadBytes('\n')
 		n := len(buff)
 		p1 := bytes.Index(buff[:n], []byte("http://"))
 		if p1 == -1 {
@@ -347,23 +398,27 @@ func doProxy(c net.Conn) {
 			log.Println("Conn.Read failed:", err)
 			return
 		}
-		ok := false
+		var method byte = 0xff
 		for _, ch := range temp[2 : buff[1]+2] {
 			if ch == 0 {
-				ok = true
+				if method == 0xff {
+					method = 0
+				}
+			} else if ch == 0x81 {
+				method = 0x81
 				break
 			}
 		}
-		if !ok {
+		if method == 0xff {
 			log.Println("Socks5 NO ACCEPTABLE METHODS:", temp[:buff[1]+2])
 			return
 		}
-		_, err = c.Write([]byte{5, 0})
+		_, err = c.Write([]byte{5, method})
 		if err != nil {
 			log.Println("Conn.Write failed:", err)
 			return
 		}
-		buff, err = cr.Peek(5)
+		buff, err = cr.(*bufio.Reader).Peek(5)
 		if err != nil {
 			log.Println("Conn.Read failed:", err)
 			return
@@ -396,10 +451,20 @@ func doProxy(c net.Conn) {
 				return
 			}
 			end := temp[4] + 5
-			domain = string(temp[5:end])
+			_domain := temp[5:end]
+			if method == 0x81 {
+				for i, c := range _domain {
+					_domain[i] = ^c
+				}
+			}
+			domain = string(_domain)
 			port = uint16(temp[end])<<8 + uint16(temp[end+1])
 		}
-		peer, direct, err = getConnectByChannel(Config.Socks5, domain, uint16(port))
+		if method == 0 {
+			peer, direct, err = getConnectByChannel(Config.Socks5, domain, uint16(port))
+		} else {
+			peer, direct, err = getProxyConnect(domain, uint16(port))
+		}
 		if err != nil {
 			log.Println("connect socks5 failed:", err)
 			temp[1] = 1
@@ -413,6 +478,10 @@ func doProxy(c net.Conn) {
 		if err != nil {
 			log.Println("Conn.Write failed:", err)
 			return
+		}
+		if method == 0x81 {
+			c = &EConn{c}
+			cr = &EReader{cr}
 		}
 		defer peer.Close()
 
