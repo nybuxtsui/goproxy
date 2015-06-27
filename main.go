@@ -91,7 +91,7 @@ func (c *ChannelDefine) switchss() {
 	c.addr = addrs[c.index]
 	addr := c.addr
 	c.lock.Unlock()
-	log.Println("switch:", addr)
+	log.Println("switch:", c.Name, ":", addr)
 }
 
 func main() {
