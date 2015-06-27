@@ -369,26 +369,13 @@ func doProxy(c net.Conn) {
 			log.Println("Conn.Read failed:", err)
 			return
 		}
-		if bytes.HasPrefix(buff, []byte("GET /switch:")) {
-			n := bytes.IndexByte(buff[12:], ' ')
-			if n == -1 {
-				log.Println("Switch error:", string(buff))
-				c.Write([]byte("HTTP/1.1 200 OK\r\n\r\nerror"))
-				return
-			}
-			name := string(buff[12 : 12+n])
+		if bytes.HasPrefix(buff, []byte("GET http://goproxy.cfg/switch ")) {
 			for i, _ := range Config.Channel {
 				channel := &Config.Channel[i]
-				if name == "all" || channel.Name == name {
-					channel.switchss()
-				}
+				channel.switchss()
 			}
-			if name == "all" || Config.Socks5.Name == name {
-				Config.Socks5.switchss()
-			}
-			if name == "all" || Config.Default.Name == name {
-				Config.Default.switchss()
-			}
+			Config.Socks5.switchss()
+			Config.Default.switchss()
 			c.Write([]byte("HTTP/1.1 200 OK\r\n\r\nok"))
 			return
 		}
