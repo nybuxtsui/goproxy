@@ -525,10 +525,7 @@ func buildSocks5Proxy(_cr io.Reader, _c net.Conn) (cr io.Reader, c net.Conn, pee
 	if err != nil {
 		log.Println("connect socks5 failed:", err)
 		temp[1] = 1
-		_, err = c.Write(temp[:n])
-		if err != nil {
-			log.Println("Conn.Write failed:", err)
-		}
+		c.Write(temp[:n])
 		return
 	}
 	_, err = c.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
