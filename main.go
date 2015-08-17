@@ -575,7 +575,6 @@ func doProxy(c net.Conn) {
 		return
 	}
 	if peer == nil {
-		log.Println("peer is nil")
 		return
 	}
 
